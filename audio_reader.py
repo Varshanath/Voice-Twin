@@ -38,10 +38,14 @@ SELECTED_FEATURES = [
 
 def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 	"""Return a fixed-width vector summarizing librosa features for one recording."""
+	# Resample every recording to the same rate and combine channels into mono so
+	# that features from different files are directly comparable.
 	signal, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
 	if signal.size == 0:
 		raise ValueError(f"Audio file is empty: {audio_path}")
 
+	# `values` stores the numeric feature vector; `column_names` records the
+	# matching labels in exactly the same order for the CSV and JSON outputs.
 	values: list[float] = []
 	column_names: list[str] = []
 
@@ -50,9 +54,15 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 		column_names.append(name)
 
 	def add_summary(name: str, feature: np.ndarray) -> None:
-		"""Append mean and standard deviation for every feature channel."""
+		"""Append mean and standard deviation for every feature channel.
+
+		Librosa features are often arrays with one row per channel/band and one
+		column per time frame. Summarizing each row produces a fixed-size vector,
+		regardless of how long the recording is.
+		"""
 		array = np.asarray(feature)
 		if np.iscomplexobj(array):
+			# Complex-valued spectra are summarized by magnitude.
 			array = np.abs(array)
 		array = array.astype(np.float64, copy=False)
 		if array.ndim == 0:
@@ -60,6 +70,8 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 		elif array.ndim == 1:
 			array = array.reshape(1, -1)
 
+		# Ignore invalid frames when calculating statistics. Rows with no valid
+		# frames receive NaN rather than causing a divide-by-zero error.
 		finite = np.isfinite(array)
 		count = finite.sum(axis=-1)
 		safe_values = np.where(finite, array, 0.0)
@@ -69,6 +81,7 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 			out=np.full(array.shape[:-1], np.nan, dtype=np.float64),
 			where=count > 0,
 		)
+		# Use population standard deviation (divide by the number of frames).
 		centered = np.where(finite, array - means[..., np.newaxis], 0.0)
 		variances = np.divide(
 			np.square(centered).sum(axis=-1),
@@ -84,7 +97,8 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 			values.extend((float(mean), float(std)))
 			column_names.extend((f"{name}_{index}_mean", f"{name}_{index}_std"))
 
-	# Time-domain features.
+	# Basic time-domain measurements: recording length, loudness, and how often
+	# the waveform crosses zero (a rough indicator of noisiness).
 	add_scalar("duration_seconds", len(signal) / sr)
 	add_summary("rms", librosa.feature.rms(y=signal, hop_length=HOP_LENGTH))
 	add_summary(
@@ -92,7 +106,8 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 		librosa.feature.zero_crossing_rate(y=signal, hop_length=HOP_LENGTH),
 	)
 
-	# Spectral and cepstral features.
+	# Spectral features describe the distribution of sound energy across
+	# frequencies. MFCCs compactly represent the broad shape of that spectrum.
 	mfcc = librosa.feature.mfcc(
 		y=signal, sr=sr, n_mfcc=N_MFCC, n_mels=N_MELS, hop_length=HOP_LENGTH
 	)
@@ -127,7 +142,8 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 		librosa.feature.poly_features(y=signal, sr=sr, order=2),
 	)
 
-	# Harmonic, chroma, and tonal features.
+	# Separate harmonic (pitched) and percussive (transient) components, then
+	# summarize pitch-class/chroma and other tonal characteristics.
 	harmonic, percussive = librosa.effects.hpss(signal)
 	add_summary(
 		"chroma_stft",
@@ -153,7 +169,8 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 		float(np.sqrt(np.mean(harmonic**2)) / (np.sqrt(np.mean(percussive**2)) + 1e-10)),
 	)
 
-	# Rhythm and onset features.
+	# Onset strength measures likely note/beat attacks. Tempograms describe
+	# periodicity over time; tempo and beat count provide compact rhythm measures.
 	onset = librosa.onset.onset_strength(y=signal, sr=sr, hop_length=HOP_LENGTH)
 	add_summary("onset_strength", onset)
 	add_summary(
@@ -175,7 +192,8 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 	)
 	add_scalar("beat_count", float(len(beat_frames)))
 
-	# Voice pitch (fundamental frequency) and voicing estimates.
+	# Estimate the fundamental voice pitch (f0) and whether each frame is voiced.
+	# Silence/unvoiced frames have no finite f0 and are excluded from pitch stats.
 	try:
 		f0, voiced_flag, voiced_probability = librosa.pyin(
 			signal,
@@ -204,10 +222,13 @@ def extract_features(audio_path: Path) -> tuple[np.ndarray, list[str]]:
 		):
 			add_scalar(name, np.nan)
 
+	# Keep the feature values compact for storage/model use; labels retain the
+	# exact order needed to interpret each position in the returned vector.
 	return np.asarray(values, dtype=np.float32), column_names
 
 
 def main() -> None:
+	# Fail early with a complete list rather than processing only some recordings.
 	missing_files = [path for path in AUDIO_FILES if not path.is_file()]
 	if missing_files:
 		missing = "\n".join(str(path) for path in missing_files)
@@ -217,12 +238,14 @@ def main() -> None:
 	reference_columns: list[str] | None = None
 	for path in AUDIO_FILES:
 		row, columns = extract_features(path)
+		# All rows must use identical feature labels for the matrix columns to line up.
 		if reference_columns is not None and columns != reference_columns:
 			raise RuntimeError(f"Feature columns differ for {path.name}")
 		reference_columns = columns
 		rows.append(row)
 		print(f"Extracted {path.name}: {row.size} features")
 
+	# Stack each recording's feature vector into one row of the dataset matrix.
 	matrix = np.vstack(rows)
 
 	# Print the selected feature values by recording name for easy comparison.
@@ -233,6 +256,7 @@ def main() -> None:
 		for feature_name in SELECTED_FEATURES:
 			print(f"  {feature_name}: {row[column_indexes[feature_name]]:.4f}")
 
+	# Save the same dataset in binary NumPy, labeled JSON metadata, and CSV formats.
 	np.save(OUTPUT_MATRIX, matrix)
 	OUTPUT_METADATA.write_text(
 		json.dumps(
